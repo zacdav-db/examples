@@ -1,0 +1,196 @@
+
+---
+title: "Collecting large results with {sparklyr}"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+%md
+## Collecting Large Results with `{sparklyr}`
+
+- Run using [13.2 ML Runtime](https://docs.databricks.com/release-notes/runtime/13.2ml.html)
+- There is no requirement to use the same cluster size
+    - Driver: `m5.8xlarge`
+    - Workers: `i3.4xlarge` (Autoscaling enabled, 1 - 6)
+```
+
+
+```{r}
+%python
+# creating widget to make notebook dynamic
+dbutils.widgets.text("Table", "zacdav.collect_sample_data")
+```
+
+
+```{r}
+%md
+### Loading libraries
+```
+
+
+```{r}
+library(arrow)
+library(dplyr)
+library(sparklyr)
+
+sc <- spark_connect(method = "databricks")
+```
+
+
+```{r}
+%md
+### Generating Test Data
+```
+
+
+```{r}
+%sql
+create or replace table ${Table} as
+with tenmillion as (
+  select
+    round(rand() * 10000) as a,
+    round(rand() * 10000) as b,
+    round(rand() * 10000) as c,
+    round(rand() * 10000) as d,
+    round(rand() * 10000) as e,
+    round(rand() * 10000) as f,
+    round(rand() * 10000) as g,
+    round(rand() * 10000) as h,
+    round(rand() * 10000) as i,
+    round(rand() * 10000) as j,
+    round(rand() * 10000) as k
+  from (explode(sequence(1, 10000000, 1)))
+)
+
+select * from tenmillion
+union 
+select * from tenmillion
+union
+select * from tenmillion
+```
+
+
+```{r}
+%md
+### Try to `collect()` generated data
+
+Should have error when collecting entire dataset
+```
+
+
+```{r}
+# oh what a surprise, this errors - we've got a reproducible example
+results <- tbl(sc, dbutils.widgets.get("Table")) %>%
+  collect()
+```
+
+
+```{r}
+# turns out we hit the limit of `collect()` at approximately 24 million rows
+# this is a function of dataset number of columns, types of columns, etc
+results <- tbl(sc, dbutils.widgets.get("Table")) %>%
+  head(24000000) %>%
+  collect()
+```
+
+
+```{r}
+%md
+### Write a function to collect the whole dataset
+
+Okay let’s write a function `collect_larger()` that directly calls `arrow_collect()` and specifies a callback that appends each batch to a list and combine it.
+```
+
+
+```{r}
+collect_larger <- function(tbl, ...) {
+  collected <- list()
+  sparklyr:::arrow_collect(tbl, ..., callback = function(batch_df) {
+    collected <<- c(collected, list(batch_df))
+  })
+  data.table::rbindlist(collected)
+}
+```
+
+
+```{r}
+%md
+Testing that our new function works...
+```
+
+
+```{r}
+# with new function we can collect whole dataset without issue
+results <- tbl(sc, dbutils.widgets.get("Table")) %>%
+  collect_larger()
+```
+
+
+```{r}
+%md
+## Benchmarking
+
+Problem solved! However, is performance comparable to using `collect()`?
+
+I ran `collect_larger()` on the whole dataset prior to ensure caching, this ensures that I’m not measuring time spent scanning data.
+
+Will be using the `{microbenchmark}` R package.
+```
+
+
+```{r}
+# we need to install microbenchmark first
+# using rstudio package manager to install faster (pre-compiled for linux)
+install.packages("microbenchmark", repos = "https://packagemanager.rstudio.com/all/__linux__/focal/latest")
+```
+
+
+```{r}
+# microbenchmark is great for this
+library(microbenchmark)
+
+dataset <- tbl(sc, dbutils.widgets.get("Table"))
+
+# takes approx ~11 mins to run on cluster hardward mentioned earlier
+benchmark_results <- microbenchmark(
+  collect_1m =  head(dataset, 1000000) %>% collect(),
+  collect_larger_1m = head(dataset, 1000000) %>% collect_larger(),
+  collect_5m = head(dataset, 5000000) %>% collect(),
+  collect_larger_5m = head(dataset, 5000000) %>% collect_larger(),
+  collect_20m = head(dataset, 20000000) %>% collect(),
+  collect_larger_20m = head(dataset, 20000000) %>% collect_larger(),
+  times = 5
+)
+```
+
+
+```{r}
+benchmark_results
+```
+
+
+```{r}
+library(ggplot2)
+autoplot(benchmark_results)
+```
+
+
+```{r}
+%md
+### Cleanup
+```
+
+
+```{r}
+spark_disconnect_all()
+```
+
+
+```{r}
+%sql
+drop table if exists ${Table}
+```
+
